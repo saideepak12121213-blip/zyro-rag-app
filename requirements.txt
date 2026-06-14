@@ -11,3 +11,4 @@ transformers
 torch
 streamlit
 langsmith
+torchvision
