@@ -6,7 +6,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-CORPUS_PATH = "./hr_docs"   # put your PDFs in this folder when deploying
+CORPUS_PATH = "./hr_docs"   # put your 11 HR PDFs in this folder when deploying
 REFUSAL_MESSAGE = (
     "I'm sorry, I can only answer HR-related questions based on Zyro Dynamics' "
     "internal policy documents. Your question appears to be outside the scope of "
@@ -24,12 +24,23 @@ REFUSAL_MESSAGE = (
     "hr.helpdesk@zyrodynamics.com for other queries."
 )
 
+# Single combined prompt — does scope-check AND answering in one call,
+# same design as the notebook, to minimize API calls and avoid rate limits.
 RAG_PROMPT = ChatPromptTemplate.from_template("""
 You are an HR Help Desk assistant for Zyro Dynamics Pvt. Ltd.
-Answer the employee's question using ONLY the information provided in the context below.
-Be concise, accurate, and professional.
-If the context does not contain enough information to answer, say so clearly.
-Do not make up information or use outside knowledge.
+
+Follow these rules strictly:
+1. First, decide if the employee's question can be answered using ONLY the context below
+   (HR policies: leave, compensation, performance, WFH, onboarding, separation, conduct,
+   IT security, POSH, travel & expense, company profile).
+2. If the question is NOT about Zyro Dynamics HR policy (e.g. about other companies,
+   general knowledge, stock prices, product features, or anything not in the context),
+   respond with EXACTLY this line and nothing else:
+   OUT_OF_SCOPE: I'm sorry, I can only answer HR-related questions based on Zyro Dynamics' internal policy documents. Your question appears to be outside the scope of what I can help with. Please contact the HR helpdesk at hr.helpdesk@zyrodynamics.com for other queries.
+3. If it IS in scope, answer concisely and accurately using ONLY the context provided.
+   Do not invent figures, dates, or policy details that are not present in the context.
+   If the context partially covers the question, answer what you can and note what is missing.
+   End your answer with a line: Source: <document name(s)>
 
 Context from HR Policy Documents:
 {context}
@@ -39,21 +50,13 @@ Employee Question: {question}
 Answer:
 """)
 
-OOS_PROMPT = ChatPromptTemplate.from_template("""
-You are a classifier. Determine if the following question is related to HR policies,
-employee benefits, leave, compensation, workplace conduct, performance, onboarding,
-separation, travel expenses, IT security, or other topics covered in an employee handbook.
-
-Question: {question}
-
-Reply with only one word: YES if it is HR-related, NO if it is not.
-""")
 
 # ── Load & cache RAG pipeline ──────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading HR policies and building knowledge base...")
 def load_rag_pipeline():
-    google_api_key = os.environ.get("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
-    os.environ["GOOGLE_API_KEY"] = google_api_key
+    # Get Groq API key from Streamlit secrets or environment
+    groq_api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+    os.environ["GROQ_API_KEY"] = groq_api_key
 
     # Load PDFs
     loader = PyPDFDirectoryLoader(CORPUS_PATH)
@@ -61,7 +64,8 @@ def load_rag_pipeline():
 
     # Chunk
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800, chunk_overlap=150,
+        chunk_size=800,
+        chunk_overlap=150,
         separators=["\n\n", "\n", ". ", " ", ""]
     )
     chunks = splitter.split_documents(documents)
@@ -78,14 +82,15 @@ def load_rag_pipeline():
         search_kwargs={"k": 5, "fetch_k": 10, "lambda_mult": 0.7}
     )
 
-    # LLM
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+    # LLM — Groq (generous free tier, fast inference)
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
         temperature=0.1,
-        max_output_tokens=512
+        max_tokens=512
     )
 
     return retriever, llm
+
 
 def format_docs(docs):
     formatted = []
@@ -95,43 +100,49 @@ def format_docs(docs):
         formatted.append(f"[Source: {source_name}]\n{doc.page_content}")
     return "\n\n---\n\n".join(formatted)
 
+
 def ask_bot(question, retriever, llm):
     parser = StrOutputParser()
 
-    # Guardrail check
-    oos_result = parser.invoke(llm.invoke(OOS_PROMPT.invoke({"question": question})))
-    if "NO" in oos_result.strip().upper():
-        return {"answer": REFUSAL_MESSAGE, "sources": [], "out_of_scope": True}
-
-    # RAG
+    # Retrieve relevant docs
     docs = retriever.invoke(question)
     context = format_docs(docs)
+
+    # Single call handles both scope-check and answering
     answer = parser.invoke(llm.invoke(RAG_PROMPT.invoke({"context": context, "question": question})))
+
+    if answer.strip().startswith("OUT_OF_SCOPE:"):
+        return {"answer": REFUSAL_MESSAGE, "sources": [], "out_of_scope": True}
+
     sources = list(set([
         d.metadata.get("source", "").split("/")[-1].replace(".pdf", "").replace("_", " ")
         for d in docs
     ]))
     return {"answer": answer, "sources": sources, "out_of_scope": False}
 
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 st.title("🏢 Zyro Dynamics HR Help Desk")
-st.caption("Powered by RAG | Ask any HR policy question")
+st.caption("Powered by RAG + Groq (Llama 3.3 70B) | Ask any HR policy question")
 st.divider()
 
 # Load pipeline
 try:
     retriever, llm = load_rag_pipeline()
-    st.success("✅ HR knowledge base loaded successfully!", icon="✅")
+    st.success("✅ HR knowledge base loaded successfully!")
 except Exception as e:
     st.error(f"Failed to load pipeline: {e}")
     st.stop()
 
-# Chat history
+# Chat history init
 if "messages" not in st.session_state:
     st.session_state.messages = []
     st.session_state.messages.append({
         "role": "assistant",
-        "content": "Hi! I'm your Zyro Dynamics HR assistant. Ask me anything about our HR policies — leave, compensation, WFH, performance reviews, and more!",
+        "content": (
+            "Hi! I'm your Zyro Dynamics HR assistant. Ask me anything about our HR policies — "
+            "leave, compensation, WFH, performance reviews, onboarding, and more! 👋"
+        ),
         "sources": []
     })
 
